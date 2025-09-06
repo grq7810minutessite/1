@@ -4,119 +4,146 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
   actions: write
+  contents: read
 
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 360   # runner limit ~6h
+    timeout-minutes: 360   # ~6h hard cap on GitHub-hosted runners
 
     env:
+      # Tailscale
       TS_AUTHKEY: tskey-auth-kCBNtpbt3H11CNTRL-rJdYwx6bnR59Gj4ivN4DR5JKvahLZ5ML
-      TS_APIKEY:  tskey-api-k8k6TMrxJD21CNTRL-UZ4q4DdnFicBmuLEc4DqicCcr34WBQkrC
+      TS_APITOKEN: tskey-api-k8k6TMrxJD21CNTRL-UZ4q4DdnFicBmuLEc4DqicCcr34WBQkrC
       TS_TAILNET: zatchati0@gmail.com
-      TS_HOST:    bullet
-      RDP_USER:   Bullettemporary
-      RDP_PASS:   Bullet@12345
+      TS_HOSTNAME: bullet
+
+      # GitHub PAT with 'repo' + 'workflow' scopes (inline as you asked)
+      GH_PAT: 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
+
+      # Partner workflow file (must match the filename below)
+      PARTNER_FILE: windows-rdp-tailscale-B.yml
+
+      # RDP account
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
 
     steps:
       - name: Install Tailscale (via choco)
-        shell: pwsh
+        shell: powershell
         run: |
           choco install tailscale -y --no-progress
-          $env:PATH = "$env:ProgramFiles\Tailscale;$env:PATH"
-          tailscale version
+          $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+          if (-not $svc) { throw "Tailscale service missing after install" }
 
       - name: Enable RDP + user + firewall
-        shell: pwsh
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          # Enable RDP
+          $ErrorActionPreference='Stop'
+          # Enable inbound RDP
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          # Create/refresh local user for RDP
-          $u = "${env:RDP_USER}"
-          $p = ConvertTo-SecureString "${env:RDP_PASS}" -AsPlainText -Force
+
+          # Create/enable local admin user
+          $u="${env:RDP_USER}"
+          $p="${env:RDP_PASS}"
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $p -AccountNeverExpires -PasswordNeverExpires:$true
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires -PasswordNeverExpires:$true | Out-Null
             Add-LocalGroupMember -Group Administrators -Member $u
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
           } else {
-            Set-LocalUser -Name $u -Password $p -AccountNeverExpires:$true
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires:$true
             Enable-LocalUser -Name $u
           }
 
-      - name: Purge ANY existing 'bullet' devices from tailnet
-        shell: pwsh
+      - name: Cleanup old device(s) from tailnet (any named "bullet")
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          $tailnet = "${env:TS_TAILNET}"
-          $apiKey  = "${env:TS_APIKEY}"
-          $hdr = @{ Authorization = "Bearer $apiKey" }
-          $tenc = [Uri]::EscapeDataString($tailnet)
-          function Get-BulletDevices {
-            $url = "https://api.tailscale.com/api/v2/tailnet/$tenc/devices?fields=all"
-            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri $url
-            return $resp.devices | Where-Object {
-              $_.hostname -eq 'bullet' -or
-              $_.name     -eq 'bullet' -or
-              ($_.dnsName -match '^bullet\.')
+          $ErrorActionPreference='Stop'
+          $hdr=@{"Authorization"="Bearer ${env:TS_APITOKEN}"}
+          $base="https://api.tailscale.com/api/v2"
+          $url="$base/tailnet/$([uri]::EscapeDataString($env:TS_TAILNET))/devices"
+          try {
+            $resp = Invoke-RestMethod -Headers $hdr -Uri $url -Method GET
+            $toDel = @($resp.devices | Where-Object { $_.hostname -ieq "${env:TS_HOSTNAME}" })
+            foreach($d in $toDel){
+              Write-Host "Deleting old device $($d.id) $($d.hostname)"
+              Invoke-RestMethod -Headers $hdr -Uri "$base/device/$($d.id)" -Method DELETE
+              Start-Sleep 1
             }
-          }
-          for ($try=1; $try -le 5; $try++) {
-            $victims = Get-BulletDevices
-            if (-not $victims) { break }
-            foreach ($d in $victims) {
-              Write-Host "Deleting old device: $($d.id)  host=$($d.hostname)  dns=$($d.dnsName)"
-              $delUrl = "https://api.tailscale.com/api/v2/device/$($d.id)"
-              Invoke-RestMethod -Method DELETE -Headers $hdr -Uri $delUrl | Out-Null
-              Start-Sleep -Milliseconds 500
-            }
-            Start-Sleep -Seconds 2
-          }
-          if (Get-BulletDevices) { Write-Warning "Some bullet devices still present." } else { Write-Host "All previous 'bullet' devices removed." }
+          } catch { Write-Warning "Tailnet cleanup skipped: $($_.Exception.Message)" }
 
-      - name: Tailscale up (fixed hostname)
-        shell: pwsh
+      - name: Tailscale up (fixed hostname) + harden service
+        shell: powershell
         run: |
-          $ErrorActionPreference = 'Stop'
-          $env:PATH = "$env:ProgramFiles\Tailscale;$env:PATH"
-          tailscale up --auth-key "${env:TS_AUTHKEY}" --hostname "${env:TS_HOST}" --accept-dns=true --unattended=true
-          $ipv4 = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -match 'Tailscale' } | Select-Object -First 1).IPAddress
+          $ErrorActionPreference='Stop'
+          # Make sure service recovery is resilient
+          sc.exe failure Tailscale reset= 86400 actions= restart/1000/restart/1000/restart/1000 | Out-Null
+          sc.exe failureflag Tailscale 1 | Out-Null
+          sc.exe config Tailscale start= auto | Out-Null
+          Start-Service Tailscale
+
+          # Login (unattended) with fixed hostname
+          tailscale up `
+            --auth-key "${env:TS_AUTHKEY}" `
+            --hostname "${env:TS_HOSTNAME}" `
+            --unattended `
+            --accept-dns=true `
+            --accept-routes=false `
+            --ssh=false
+
+          # Show connection details
+          $self = tailscale status --self | ConvertFrom-Json
+          $ipv4 = ($self.Addresses | Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) | Select-Object -First 1
+          $magic = tailscale status --json | ConvertFrom-Json | Select-Object -ExpandProperty MagicDNSSuffix -ErrorAction SilentlyContinue
+          if (-not $magic) { $magic = "ts.net" }
+          $mname = "${env:TS_HOSTNAME}.$magic"
 
           Write-Host "================ RDP CONNECT ================"
-          Write-Host "MagicDNS : ${env:TS_HOST}"
-          Write-Host "IPv4     : $ipv4"
-          Write-Host "mstsc    : mstsc /v:${env:TS_HOST}"
-          Write-Host "Username : ${env:RDP_USER}"
-          Write-Host "Password : ${env:RDP_PASS}"
+          Write-Host ("MagicDNS : {0}" -f $mname)
+          Write-Host ("IPv4     : {0}" -f $ipv4)
+          Write-Host ("mstsc    : mstsc /v:{0}" -f $mname)
+          Write-Host ("Username : {0}" -f $env:RDP_USER)
+          Write-Host ("Password : {0}" -f $env:RDP_PASS)
           Write-Host "============================================"
 
-      - name: Pre-dispatch partner (B) in background (t-5m)
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Keep alive (~5h55m) & pre-dispatch partner (B)
+        shell: powershell
         run: |
-          $parts = $env:GITHUB_REPOSITORY.Split('/')
-          $owner,$repo = $parts[0],$parts[1]
-          $workflowFile = 'windows-rdp-tailscale-B.yml'
-          $seconds = 355*60 - 300  # (5h55m - 5m)
-          Start-Job -ScriptBlock {
-            param($o,$r,$wf,$tok,$sec)
-            Start-Sleep -Seconds $sec
-            $uri  = "https://api.github.com/repos/$o/$r/actions/workflows/$wf/dispatches"
-            $body = @{ ref = $env:GITHUB_REF_NAME } | ConvertTo-Json
-            Invoke-RestMethod -Method POST -Uri $uri -Headers @{ Authorization="Bearer $tok"; "Accept"="application/vnd.github+json"; "User-Agent"="gha" } -Body $body
-            Write-Host "Partner workflow dispatched: $wf"
-          } -ArgumentList $owner,$repo,$workflowFile,$env:GH_TOKEN,$seconds | Out-Null
-          Write-Host "Background dispatcher armed."
-
-      - name: Keep alive (~5h55m)
-        shell: pwsh
-        run: |
-          $until = (Get-Date).AddMinutes(355)
-          while ((Get-Date) -lt $until) {
-            Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP alive.."
-            Start-Sleep 60
+          $ErrorActionPreference='Stop'
+          $until   = (Get-Date).AddMinutes(355)   # start partner ~5 min before 360
+          $fired = $false
+          while((Get-Date) -lt (Get-Date).AddMinutes(358)) {
+            # watchdog: start tailscale service if it stopped for any reason
+            try {
+              $svc = Get-Service -Name Tailscale -ErrorAction Stop
+              if ($svc.Status -ne 'Running'){ Start-Service Tailscale }
+            } catch { }
+            # print heartbeat + connection hints every 2 min
+            $now = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            Write-Host "[$now] RDP alive | $env:TS_HOSTNAME"
+            if (-not $fired -and (Get-Date) -ge $until) {
+              Write-Host "Dispatching partner workflow B..."
+              $repo = "${env:GITHUB_REPOSITORY}"
+              $hdr = @{
+                "Accept"        = "application/vnd.github+json"
+                "Authorization" = "Bearer ${env:GH_PAT}"
+              }
+              $body = @{ ref = "${env:GITHUB_REF_NAME}"; inputs = @{ from = 'A' } } | ConvertTo-Json
+              $url  = "https://api.github.com/repos/$repo/actions/workflows/${env:PARTNER_FILE}/dispatches"
+              try {
+                Invoke-RestMethod -Method POST -Headers $hdr -Body $body -Uri $url | Out-Null
+                $fired = $true
+                Write-Host "Partner dispatched."
+              } catch {
+                Write-Warning "Dispatch failed: $($_.Exception.Message)"
+              }
+            }
+            Start-Sleep -Seconds 120
           }
+
+      - name: Complete job
+        shell: powershell
+        run: echo "Done."
