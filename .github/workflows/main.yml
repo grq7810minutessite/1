@@ -1,0 +1,180 @@
+name: Windows RDP via Tailscale (Merged)
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_mode:
+        description: "Run a short 10-minute test instead of ~6 hours"
+        type: boolean
+        default: false
+      loop:
+        description: "Auto chain: re-dispatch this workflow near end to keep running"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: rdp-tailscale-merged
+  cancel-in-progress: false
+
+env:
+  # Timing
+  RUNTIME_MINUTES: ${{ inputs.test_mode && '10' || '355' }}
+  OVERLAP_MINUTES: ${{ inputs.test_mode && '2'  || '5'   }}
+  # Inline keys (⚠ visible in repo/logs)
+  TS_AUTHKEY: tskey-auth-kCBNtpbt3H11CNTRL-rJdYwx6bnR59Gj4ivN4DR5JKvahLZ5ML
+  TS_API_KEY: Bearer tskey-api-k8k6TMrxJD21CNTRL-UZ4q4DdnFicBmuLEc4DqicCcr34WBQkrC
+  TS_TAILNET: zatchati0@gmail.com
+  GH_PAT: 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
+  # RDP local user
+  RDP_USER: Bullettemporary
+  RDP_PASS: Bullet@12345
+  # Permanent hostname
+  TS_HOSTNAME: bullet
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - name: Fast install Tailscale
+        shell: pwsh
+        run: |
+          $url = 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe'
+          $dst = "$env:TEMP\tailscale-setup.exe"
+          Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing
+          Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+      - name: Enable RDP + user + firewall
+        shell: pwsh
+        run: |
+          $u = $env:RDP_USER
+          $p = $env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires -PasswordNeverExpires:$true
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires:$true
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+      - name: PURGE tailnet devices (hostname startswith 'bullet')
+        shell: pwsh
+        run: |
+          $hdr = @{ Authorization = "$env:TS_API_KEY" }
+          $tailnetEnc = [uri]::EscapeDataString($env:TS_TAILNET)
+          $url = "https://api.tailscale.com/api/v2/tailnet/$tailnetEnc/devices"
+          $pattern = '^(bullet)(?:-\d+)?$'
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri $url
+            if ($resp -and $resp.devices) {
+              foreach ($d in $resp.devices) {
+                $name = @($d.hostname, $d.name, $d.displayName | Where-Object { $_ })[0]
+                if ($null -ne $name -and $name.ToString().Trim().ToLower() -match $pattern) {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                  Write-Host "Deleted device: $name [$($d.id)]"
+                }
+              }
+            } else {
+              Write-Host "No devices returned by API."
+            }
+          } catch { Write-Warning "Purge failed: $_" }
+
+      - name: Tailscale up (permanent hostname)
+        shell: pwsh
+        run: |
+          $ts = "$Env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { $ts = "${Env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
+          if (-not (Test-Path $ts)) { throw 'tailscale.exe not found after install' }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+          & $ts up --auth-key "$env:TS_AUTHKEY" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep 3
+          $ipv4 = (& $ts ip -4 | Select-Object -First 1)
+          $ipv6 = (& $ts ip -6 | Select-Object -First 1)
+          "### RDP CONNECT`n**Hostname**: $env:TS_HOSTNAME`n**IPv4**: $ipv4`n**IPv6**: $ipv6`n**MSTSC**: mstsc /v:$env:TS_HOSTNAME`n**Username**: $env:RDP_USER`n**Password**: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host "================ RDP CONNECT ================"
+          Write-Host "Hostname : $env:TS_HOSTNAME"
+          Write-Host "IPv4     : $ipv4"
+          Write-Host "IPv6     : $ipv6"
+          Write-Host "mstsc    : mstsc /v:$env:TS_HOSTNAME"
+          Write-Host "Username : $env:RDP_USER"
+          Write-Host "Password : $env:RDP_PASS"
+          Write-Host "============================================"
+
+      - name: Debug: Print MagicDNS & DERP region
+        shell: pwsh
+        run: |
+          $ts = "$Env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) { $ts = "${Env:ProgramFiles(x86)}\Tailscale\tailscale.exe" }
+          $status = & $ts status --json | ConvertFrom-Json
+          $fqdn = $status.Self.DNSName
+          $derp = $status.Self.DERPRegionName
+          Write-Host "MagicDNS FQDN: $fqdn"
+          Write-Host "DERP Region: $derp"
+          @"
+### Debug Info
+MagicDNS FQDN: $fqdn
+DERP Region: $derp
+"@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Keep alive & optional self-dispatch (loop)
+        shell: pwsh
+        env:
+          WORKFLOW_FILE: windows-rdp-tailscale.yml
+          DO_LOOP: ${{ inputs.loop && '1' || '0' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          [int]$total = $env:RUNTIME_MINUTES
+          [int]$lead  = $env:OVERLAP_MINUTES
+          if ($lead -ge $total) { $lead = [Math]::Max(1, $total - 1) }
+
+          $endAt = (Get-Date).AddMinutes($total)
+          $dispatched = $false
+
+          while ((Get-Date) -lt $endAt) {
+            $minsLeft = [int]([math]::Ceiling(($endAt - (Get-Date)).TotalMinutes))
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] RDP alive.. ($minsLeft min left)"
+            Start-Sleep -Seconds 60
+
+            if (-not $dispatched -and $env:DO_LOOP -eq '1' -and $minsLeft -le $lead) {
+              Write-Host "Dispatching self (loop) with ref: ${{ github.ref_name }}"
+              Invoke-RestMethod -Method POST `
+                -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/$($env:WORKFLOW_FILE)/dispatches" `
+                -Headers @{ Authorization = "token $env:GH_PAT"; "Accept"="application/vnd.github+json" } `
+                -Body (@{ ref = "${{ github.ref_name }}"; inputs = @{ test_mode = "${{ inputs.test_mode }}"; loop = "true" } } | ConvertTo-Json)
+              $dispatched = $true
+              Start-Sleep -Seconds 20
+              try { Stop-Service Tailscale -ErrorAction SilentlyContinue } catch {}
+            }
+          }
+
+      - name: Final purge 'bullet*' (always)
+        if: always()
+        shell: pwsh
+        run: |
+          $hdr = @{ Authorization = "$env:TS_API_KEY" }
+          $tailnetEnc = [uri]::EscapeDataString($env:TS_TAILNET)
+          $url = "https://api.tailscale.com/api/v2/tailnet/$tailnetEnc/devices"
+          $pattern = '^(bullet)(?:-\d+)?$'
+          try {
+            $resp = Invoke-RestMethod -Method GET -Headers $hdr -Uri $url
+            if ($resp -and $resp.devices) {
+              foreach ($d in $resp.devices) {
+                $name = @($d.hostname, $d.name, $d.displayName | Where-Object { $_ })[0]
+                if ($null -ne $name -and $name.ToString().Trim().ToLower() -match $pattern) {
+                  Invoke-RestMethod -Method DELETE -Headers $hdr -Uri ("https://api.tailscale.com/api/v2/device/{0}" -f $d.id) | Out-Null
+                  Write-Host "Deleted at exit: $name [$($d.id)]"
+                }
+              }
+            } else {
+              Write-Host "No devices returned by API."
+            }
+          } catch { Write-Warning "Final purge failed: $_" }
