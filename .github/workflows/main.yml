@@ -109,7 +109,7 @@ jobs:
           Write-Host "Password : $env:RDP_PASS"
           Write-Host "============================================"
 
-      - name: Debug: Print MagicDNS & DERP region
+      - name: "Debug: Print MagicDNS & DERP region"
         shell: pwsh
         run: |
           $ts = "$Env:ProgramFiles\Tailscale\tailscale.exe"
@@ -119,13 +119,10 @@ jobs:
           $derp = $status.Self.DERPRegionName
           Write-Host "MagicDNS FQDN: $fqdn"
           Write-Host "DERP Region: $derp"
-          @"
-### Debug Info
-MagicDNS FQDN: $fqdn
-DERP Region: $derp
-"@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $summary = "### Debug Info`nMagicDNS FQDN: $fqdn`nDERP Region: $derp"
+          $summary | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Keep alive & optional self-dispatch (loop)
+      - name: "Keep alive & optional self-dispatch (loop)"
         shell: pwsh
         env:
           WORKFLOW_FILE: windows-rdp-tailscale.yml
