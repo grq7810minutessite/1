@@ -1,0 +1,232 @@
+name: RDP via Tailscale (B → A, per-field inputs, save-data, Win2025)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ts_tailnet:      { description: "Tailscale tailnet (email). Leave blank if saved", required: false, default: "" }
+      ts_api_key:      { description: "Tailscale API key. Leave blank if saved", required: false, default: "" }
+      ts_authkey:      { description: "Tailscale Auth key. Leave blank if saved", required: false, default: "" }
+      test_mode:
+        description: "Run 5-minute test"
+        type: boolean
+        default: false
+      runtime_minutes: { description: "Runtime in minutes (max 360; capped 355). Leave blank if saved", required: false, default: "355" }
+
+      # Dispatch A (same repo if blank)
+      a_repo_path:     { description: "Target repo for Workflow A (owner/repo). Blank = same repo", required: false, default: "" }
+      gh_token_a:      { description: "PAT for target repo (only if cross-repo)", required: false, default: "" }
+
+      # Telegram logs/reminders
+      tg_token:        { description: "Telegram bot token (optional)", required: false, default: "" }
+      tg_chat:         { description: "Telegram chat ID (optional)", required: false, default: "" }
+
+      # Save resolved values into repo to reuse next time
+      save_data:
+        description: "Save all resolved values to .github/rdp-config.json"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: tailscale-rdp-singleton
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  rdp:
+    runs-on: windows-2025
+    timeout-minutes: 370
+    env:
+      RDP_USER:    Bullettemporary
+      RDP_PASS:    Bullet@12345
+      TS_HOSTNAME: bullet
+    steps:
+      - name: Checkout (for config save/load)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Build & run (B)
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          function IntOr($v,$def){ if("$v" -match '^\s*\d+\s*$'){ [int]$v } else { [int]$def } }
+          function Yes($v){ "$v" -match '^(?i:true|1|yes|on)$' }
+          function Fill($in,$cfg){ if([string]::IsNullOrWhiteSpace($in) -and $cfg){$cfg}else{$in} }
+          function Summary($title,[string[]]$lines){ (@("### $title") + $lines + "") -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8 }
+
+          # --- Load saved config
+          $CfgPath = Join-Path $env:GITHUB_WORKSPACE ".github\rdp-config.json"
+          $cfg = $null
+          if (Test-Path -LiteralPath $CfgPath) {
+            try { $cfg = Get-Content -LiteralPath $CfgPath -Raw | ConvertFrom-Json } catch {}
+          }
+
+          # --- Resolve inputs
+          $tailnet   = Fill "${{ inputs.ts_tailnet }}"  $cfg.ts_tailnet
+          $apiKey    = Fill "${{ inputs.ts_api_key }}"  $cfg.ts_api_key
+          $authKey   = Fill "${{ inputs.ts_authkey }}"  $cfg.ts_authkey
+          $runtime   = IntOr("${{ inputs.runtime_minutes }}", $(if($cfg.runtime_minutes){[int]$cfg.runtime_minutes}else{355}))
+          if (${{ inputs.test_mode }}) { $runtime = 5 } elseif ($runtime -gt 360) { $runtime = 355 } elseif ($runtime -lt 6) { $runtime = 355 }
+
+          $aRepoPath = Fill "${{ inputs.a_repo_path }}" $cfg.a_repo_path
+          $ghTokenA  = Fill "${{ inputs.gh_token_a }}"  $cfg.gh_token_a
+
+          $tgToken   = Fill "${{ inputs.tg_token }}"    $cfg.tg_token
+          $tgChat    = Fill "${{ inputs.tg_chat }}"     $cfg.tg_chat
+          $tgEnabled = -not [string]::IsNullOrWhiteSpace($tgToken) -and -not [string]::IsNullOrWhiteSpace($tgChat)
+
+          # --- Telegram helpers
+          function TgSend([string]$text){
+            if(-not $tgEnabled){ return }
+            for($i=0; $i -lt $text.Length; $i+=3900){
+              $chunk=$text.Substring($i,[Math]::Min(3900,$text.Length-$i))
+              try{
+                Invoke-WebRequest -Method POST -Uri ("https://api.telegram.org/bot{0}/sendMessage" -f $tgToken) `
+                  -ContentType "application/x-www-form-urlencoded" `
+                  -Body @{chat_id=$tgChat; text=$chunk; parse_mode="Markdown"} -UseBasicParsing | Out-Null
+              }catch{}
+            }
+          }
+          function TgSendPhoto([string]$p,[string]$cap){
+            if(-not $tgEnabled -or -not (Test-Path -LiteralPath $p)){ return }
+            try{
+              $form=@{ chat_id=$tgChat; caption=$cap; parse_mode="Markdown"; photo=Get-Item -LiteralPath $p }
+              Invoke-WebRequest -Method POST -Uri ("https://api.telegram.org/bot{0}/sendPhoto" -f $tgToken) -Form $form -UseBasicParsing | Out-Null
+            }catch{
+              try{
+                $form=@{ chat_id=$tgChat; caption=$cap; parse_mode="Markdown"; document=Get-Item -LiteralPath $p }
+                Invoke-WebRequest -Method POST -Uri ("https://api.telegram.org/bot{0}/sendDocument" -f $tgToken) -Form $form -UseBasicParsing | Out-Null
+              }catch{}
+            }
+          }
+
+          # --- Install + enable Tailscale & RDP
+          $ts="C:\Program Files\Tailscale\tailscale.exe"
+          if(-not (Test-Path $ts)){
+            $dst="$env:TEMP\tailscale-setup.exe"
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' -OutFile $dst -UseBasicParsing
+            Start-Process -FilePath $dst -ArgumentList "/quiet" -Wait
+          }
+          Start-Service Tailscale -ErrorAction SilentlyContinue
+
+          $u=$env:RDP_USER; $p=$env:RDP_PASS; $sec=ConvertTo-SecureString $p -AsPlainText -Force
+          if(-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)){
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group Administrators -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+
+          # --- Connect Tailscale
+          & $ts logout | Out-Null
+          & $ts up --authkey "$authKey" --hostname "$env:TS_HOSTNAME" --accept-routes --accept-dns=false
+          Start-Sleep -Seconds 2
+          $ip4 = (& $ts ip -4 | Select-Object -First 1)
+          $st  = & $ts status --json | ConvertFrom-Json
+
+          Summary "RDP (B)" @(
+            "**User:** $env:RDP_USER",
+            "**Pass:** $env:RDP_PASS",
+            "**IPv4:** $ip4",
+            "**MagicDNS:** $($st.Self.DNSName)"
+          )
+          TgSend ("🟧 *B started* — runtime: *$runtime* min; next: *A*")
+
+          # --- Screenshot (start)
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $sp="$env:RUNNER_TEMP\rdp-start.png"
+            $bmp.Save($sp,[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            TgSendPhoto $sp ("🖼 *B start screenshot* — {0}" -f (Get-Date).ToString("HH:mm:ss 'IST' dd-MMM"))
+          } catch {}
+
+          # --- Keep alive with hourly Telegram reminders
+          $end=(Get-Date).AddMinutes($runtime); $lastHour=-1
+          while((Get-Date) -lt $end){
+            $left=[int]([math]::Ceiling(($end-(Get-Date)).TotalMinutes))
+            Write-Host "RDP alive... ($left min left)"
+            $hr=[int][math]::Floor($left/60)
+            if($hr -ne $lastHour){ $lastHour=$hr; TgSend ("⏰ *B reminder*: $left min left (~$hr h)") }
+            Start-Sleep -Seconds 60
+          }
+
+          # --- Screenshot (end)
+          try {
+            Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
+            $b=[System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $bmp=New-Object System.Drawing.Bitmap $b.Width,$b.Height
+            $g=[System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.Location,[System.Drawing.Point]::Empty,$b.Size)
+            $ep="$env:RUNNER_TEMP\rdp-end.png"
+            $bmp.Save($ep,[System.Drawing.Imaging.ImageFormat]::Png)
+            $g.Dispose(); $bmp.Dispose()
+            TgSendPhoto $ep ("🖼 *B end screenshot* — {0}" -f (Get-Date).ToString("HH:mm:ss 'IST' dd-MMM"))
+          } catch {}
+
+          # --- Save config
+          if (${{ inputs.save_data }}) {
+            try{
+              New-Item -ItemType Directory -Path (Split-Path -Parent $CfgPath) -Force | Out-Null
+              $conf=[ordered]@{
+                ts_tailnet=$tailnet; ts_api_key=$apiKey; ts_authkey=$authKey; runtime_minutes=$runtime;
+                a_repo_path=$aRepoPath; gh_token_a=$ghTokenA; tg_token=$tgToken; tg_chat=$tgChat
+              }
+              ($conf|ConvertTo-Json -Depth 5)|Out-File -Encoding UTF8 $CfgPath
+              Push-Location $env:GITHUB_WORKSPACE
+              git config user.name  "rdp-pingpong-bot"
+              git config user.email "actions@users.noreply.github.com"
+              if((git status --porcelain) -ne ""){ git add "$CfgPath"; git commit -m "chore(rdp B): save config $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"; git push }
+              Pop-Location
+            }catch{ Write-Warning "Save config failed: $_" }
+          }
+
+          # --- Dispatch Workflow A
+          $targetRepo = if([string]::IsNullOrWhiteSpace($aRepoPath)){"${{ github.repository }}"}else{$aRepoPath}
+          $sameRepo   = ($targetRepo -eq "${{ github.repository }}")
+          $token      = if($sameRepo){"${{ github.token }}"}else{$ghTokenA}
+          if(-not $sameRepo -and [string]::IsNullOrWhiteSpace($token)){
+            Write-Error "a_repo_path is set, but gh_token_a is empty."
+            exit 1
+          }
+
+          $payload=@{
+            ts_tailnet=$tailnet; ts_api_key=$apiKey; ts_authkey=$authKey;
+            test_mode="false"; runtime_minutes="$runtime";
+            tg_token=$tgToken; tg_chat=$tgChat; save_data="${{ inputs.save_data }}"
+          }
+          $url="https://api.github.com/repos/$targetRepo/actions/workflows/rdp-tailscale-A.yml/dispatches"
+          $hdr=@{ Authorization="Bearer $token"; Accept="application/vnd.github+json"; "User-Agent"="rdp-pingpong" }
+          $body=@{ ref="${{ github.ref_name }}"; inputs=$payload }|ConvertTo-Json -Depth 6
+          Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body -UseBasicParsing | Out-Null
+          Write-Host "Dispatched Workflow A to $targetRepo"
+
+      - name: ⬆️ Upload screenshot (start)
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-start-screenshot-B
+          path: ${{ runner.temp }}/rdp-start.png
+          if-no-files-found: warn
+
+      - name: ⬆️ Upload screenshot (end)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-end-screenshot-B
+          path: ${{ runner.temp }}/rdp-end.png
+          if-no-files-found: warn
